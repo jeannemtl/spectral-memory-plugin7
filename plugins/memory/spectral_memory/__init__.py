@@ -25,7 +25,7 @@ ENCODE_SCHEMA = {
         "properties": {
             "label": {
                 "type": "string",
-                "description": "Channel label e.g. USER.name, TASK.current, PROJ.accuracy",
+                "description": "Channel label e.g. USER.gpu, TASK.current, PROJ.accuracy",
                 "enum": [
                     "USER.name", "USER.project", "USER.affiliation",
                     "USER.gpu", "USER.working_dir", "USER.os",
@@ -45,11 +45,31 @@ ENCODE_SCHEMA = {
 
 DECODE_SCHEMA = {
     "name": "fdm_decode",
-    "description": "Retrieve a specific structured fact from Spectral Memory by channel label.",
+    "description": (
+        "Retrieve a structured fact from Spectral Memory by channel label. "
+        "Fast path — reads from persistent state in 0ms. "
+        "Use this for routine fact retrieval."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "label": {"type": "string", "description": "Channel label to retrieve"},
+        },
+        "required": ["label"],
+    },
+}
+
+DECODE_SPECTRAL_SCHEMA = {
+    "name": "fdm_decode_spectral",
+    "description": (
+        "Retrieve a structured fact by reading the FDM signal directly via model inference (~600ms). "
+        "Use after context compression to verify facts survived, or when state may have been lost. "
+        "Slower than fdm_decode but reads spectrally from the encoded signal."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "description": "Channel label to retrieve spectrally"},
         },
         "required": ["label"],
     },
@@ -72,7 +92,7 @@ def _load_config() -> dict:
 
 class SpectralMemoryProvider(MemoryProvider):
     """Spectral Memory — frequency-encoded structured memory.
-    40 facts. Same token budget. Lossless under compression.
+    20 facts. Same token budget. Lossless under compression.
     """
 
     def __init__(self):
@@ -112,7 +132,7 @@ class SpectralMemoryProvider(MemoryProvider):
 
     def get_config_schema(self):
         return [
-            {"key": "api_key", "description": "Spectral Memory API key", "secret": True, "env_var": "SPECTRAL_MEMORY_API_KEY", "url": "https://spectralmemory.dev"},
+            {"key": "api_key", "description": "Spectral Memory API key", "secret": True, "env_var": "SPECTRAL_MEMORY_API_KEY", "url": "https://spectralmemory.com"},
             {"key": "user_id", "description": "User identifier for this agent", "default": "default"},
             {"key": "api_url", "description": "API endpoint", "default": "https://api.spectralmemory.com"},
         ]
@@ -122,11 +142,18 @@ class SpectralMemoryProvider(MemoryProvider):
         self._api_key = self._config.get("api_key") or os.environ.get("SPECTRAL_MEMORY_API_KEY", "")
         self._api_url = self._config.get("api_url", "https://api.spectralmemory.com").rstrip("/")
         self._user_id = self._config.get("user_id", "default")
-        self._client = httpx.Client(headers={"Authorization": f"Bearer {self._api_key}"}, timeout=30.0)
+        self._client = httpx.Client(
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout=30.0,
+        )
 
-    def _get(self, path: str, **params) -> dict:
+    def _get(self, path: str, timeout: float = 30.0, **params) -> dict:
         try:
-            r = self._client.get(f"{self._api_url}{path}", params={"user_id": self._user_id, **params})
+            r = self._client.get(
+                f"{self._api_url}{path}",
+                params={"user_id": self._user_id, **params},
+                timeout=timeout,
+            )
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -135,7 +162,10 @@ class SpectralMemoryProvider(MemoryProvider):
 
     def _post(self, path: str, body: dict) -> dict:
         try:
-            r = self._client.post(f"{self._api_url}{path}", json={"user_id": self._user_id, **body})
+            r = self._client.post(
+                f"{self._api_url}{path}",
+                json={"user_id": self._user_id, **body},
+            )
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -145,9 +175,12 @@ class SpectralMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         return (
             "# Spectral Memory\n"
-            "Active. Structured facts are frequency-encoded across 40 channels.\n"
-            "Use fdm_encode to store discrete facts. Use fdm_decode to retrieve specific values.\n"
-            "The [MEM] block in context is the encoded signal — do not edit it directly."
+            "Active. Structured facts are frequency-encoded across 20 channels.\n"
+            "Use fdm_encode to store discrete facts.\n"
+            "Use fdm_decode to retrieve specific values instantly (0ms, from state).\n"
+            "Use fdm_decode_spectral to read directly from the signal (~600ms) — "
+            "use after compression to verify facts survived.\n"
+            "The [MEMORY] block in context is the encoded signal — do not edit it directly."
         )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -158,10 +191,15 @@ class SpectralMemoryProvider(MemoryProvider):
                 plain_index = result.get("plain_index", "")
                 if fdm_block:
                     with self._prefetch_lock:
-                        self._prefetch_result = f"{fdm_block}\n\n<!-- Spectral Memory channel index -->\n{plain_index}"
+                        self._prefetch_result = (
+                            f"{fdm_block}\n\n"
+                            f"<!-- Spectral Memory channel index -->\n{plain_index}"
+                        )
             except Exception as e:
                 logger.warning("Spectral Memory prefetch failed: %s", e)
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="spectral-prefetch")
+        self._prefetch_thread = threading.Thread(
+            target=_run, daemon=True, name="spectral-prefetch"
+        )
         self._prefetch_thread.start()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -176,7 +214,7 @@ class SpectralMemoryProvider(MemoryProvider):
         pass
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [ENCODE_SCHEMA, DECODE_SCHEMA]
+        return [ENCODE_SCHEMA, DECODE_SCHEMA, DECODE_SPECTRAL_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "fdm_encode":
@@ -187,7 +225,13 @@ class SpectralMemoryProvider(MemoryProvider):
             result = self._post("/encode", {"label": label, "value": value})
             if not result:
                 return _tool_error("fdm_encode failed — check API key and connection")
-            return json.dumps({"result": f"Encoded {label}={value!r} on channel {result.get('channel', '?')}. {result.get('channel_count', '?')} facts total."})
+            return json.dumps({
+                "result": (
+                    f"Encoded {label}={value!r} on channel {result.get('channel', '?')}. "
+                    f"{result.get('channel_count', '?')} facts total."
+                )
+            })
+
         elif tool_name == "fdm_decode":
             label = args.get("label", "")
             if not label:
@@ -195,7 +239,25 @@ class SpectralMemoryProvider(MemoryProvider):
             result = self._get("/decode", label=label)
             if not result:
                 return _tool_error(f"fdm_decode failed for {label}")
-            return json.dumps({"result": f"{label} = {result.get('value', 'not found')}"})
+            return json.dumps({
+                "result": f"{label} = {result.get('value', 'not found')}",
+                "source": result.get("source", "state"),
+                "latency_ms": result.get("latency_ms", 0),
+            })
+
+        elif tool_name == "fdm_decode_spectral":
+            label = args.get("label", "")
+            if not label:
+                return _tool_error("fdm_decode_spectral requires label")
+            result = self._get("/decode/model", timeout=120.0, label=label)
+            if not result:
+                return _tool_error(f"fdm_decode_spectral failed for {label}")
+            return json.dumps({
+                "result": f"{label} = {result.get('value', 'not found')}",
+                "source": "model",
+                "latency_ms": result.get("latency_ms", 0),
+            })
+
         return _tool_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
